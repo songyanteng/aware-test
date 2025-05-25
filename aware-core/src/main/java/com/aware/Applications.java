@@ -18,6 +18,7 @@ import android.database.sqlite.SQLiteException;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.Looper;
 import android.provider.Settings;
 import android.util.DisplayMetrics;
@@ -110,7 +111,7 @@ public class Applications extends AccessibilityService {
 
     ArrayList<Integer> textBuffer = new ArrayList<Integer>();
 
-    int TEXT_BUFFER_LIMIT = 500;
+    int TEXT_BUFFER_LIMIT = 50;
 
 //    int mDebugDepth = 0;
 
@@ -128,9 +129,57 @@ public class Applications extends AccessibilityService {
 
     private Handler handler = new Handler(Looper.getMainLooper());
     private JSONArray latestScreenText;
-    private Runnable screenTextSaver;
     private static final int SCREEN_TEXT_DELAY_MS = 500;
 
+    private HandlerThread backgroundThread;
+    private Handler backgroundHandler;
+
+    private String lastCapturedAppName = "";
+    private String lastCapturedClassName = "";
+    private int lastCapturedAction = -1;
+    private int lastCapturedEventType = -1;
+
+    /**
+     * Runnable that saves the latest captured screen text into a buffer. When the buffer reaches the
+     * TEXT_BUFFER_LIMIT, it flushes all entries to the content provider and broadcasts a screen text detection event.
+     * This helps offload I/O to a background thread and avoids excessive writes.
+     *
+     * Must be called from a background thread to prevent UI thread blocking.
+     */
+
+    private final Runnable screenTextSaver = new Runnable() {
+        @Override
+        public void run() {
+            Log.d(TAG, "Running screenTextSaver on thread: " + Thread.currentThread().getName());
+
+            if (latestScreenText == null || latestScreenText.length() == 0) return;
+
+            ContentValues cv = new ContentValues();
+            cv.put(ScreenText_Provider.ScreenTextData.TIMESTAMP, System.currentTimeMillis());
+            cv.put(ScreenText_Provider.ScreenTextData.DEVICE_ID, Aware.getSetting(getApplicationContext(), Aware_Preferences.DEVICE_ID));
+            cv.put(ScreenText_Provider.ScreenTextData.PACKAGE_NAME, lastCapturedAppName);
+            cv.put(ScreenText_Provider.ScreenTextData.CLASS_NAME, lastCapturedClassName);
+            cv.put(ScreenText_Provider.ScreenTextData.USER_ACTION, lastCapturedAction);
+            cv.put(ScreenText_Provider.ScreenTextData.EVENT_TYPE, lastCapturedEventType);
+            cv.put(ScreenText_Provider.ScreenTextData.TEXT, latestScreenText.toString());
+
+            Log.d(TAG, "SCREENTEXT: " + latestScreenText.toString());
+
+            synchronized (contentBuffer) {
+                contentBuffer.add(cv);
+
+                if (contentBuffer.size() >= TEXT_BUFFER_LIMIT) {
+                    for (ContentValues content : contentBuffer) {
+                        getContentResolver().insert(ScreenText_Provider.ScreenTextData.CONTENT_URI, content);
+                        if (awareSensor != null) awareSensor.onScreentext(content);
+                        sendBroadcast(new Intent(ScreenText.ACTION_SCREENTEXT_DETECT));
+                    }
+                    contentBuffer.clear();
+                }
+            }
+            latestScreenText = null;
+        }
+    };
 
     /**
      * Recursively track all the text on the screen in a tree structure to the text variable
@@ -242,7 +291,7 @@ public class Applications extends AccessibilityService {
                     && type != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
                 return;
             }
-            // 2.1. Build list of visible text nodes
+
             AccessibilityNodeInfo root = getRootInActiveWindow();
             if (root == null) return;
             List<AccessibilityNodeInfo> textNodes = new ArrayList<>();
@@ -250,18 +299,18 @@ public class Applications extends AccessibilityService {
 
             if (textNodes.isEmpty()) return;
 
-            // 2.2. Decide whether we're tracking this app
             String packageName = event.getPackageName().toString();
             boolean track = shouldTrack(packageName);
             if (!track) return;
 
-            // 2.3. Get the user-friendly app name
-            String appName = getApplicationName(packageName);
+            lastCapturedAppName = getApplicationName(packageName);
+            lastCapturedClassName = event.getClassName() != null ? event.getClassName().toString() : "";
+            lastCapturedAction = event.getAction();
+            lastCapturedEventType = event.getEventType();
 
             Set<Integer> seenHashes = new HashSet<>();
             JSONArray allNodes = new JSONArray();
 
-            // 2.4. For each node, build a separate record
             for (AccessibilityNodeInfo node : textNodes) {
                 String text = node.getText() != null ? node.getText().toString() : "";
                 int hash = text.hashCode();
@@ -270,7 +319,7 @@ public class Applications extends AccessibilityService {
 
                 try {
                     JSONObject payload = new JSONObject();
-                    payload.put("text", node.getText().toString());
+                    payload.put("text", text);
                     payload.put("viewClass", node.getClassName().toString());
 
                     if (node.getViewIdResourceName() != null) {
@@ -287,46 +336,15 @@ public class Applications extends AccessibilityService {
                 }
             }
 
-            latestScreenText = allNodes;
+            synchronized (this) {
+                latestScreenText = allNodes;
+            }
 
-            // Cancel any previous save and schedule a new one
-            if (screenTextSaver != null) handler.removeCallbacks(screenTextSaver);
-
-            screenTextSaver = new Runnable() {
-                @Override
-                public void run() {
-                    if (latestScreenText == null || latestScreenText.length() == 0) return;
-
-                    ContentValues cv = new ContentValues();
-                    long timestamp = System.currentTimeMillis();
-                    SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault());
-                    sdf.setTimeZone(TimeZone.getTimeZone("GMT+11"));
-                    String formattedTime = sdf.format(new Date(timestamp));
-
-                    cv.put(ScreenText_Provider.ScreenTextData.TIMESTAMP, formattedTime);
-                    cv.put(ScreenText_Provider.ScreenTextData.DEVICE_ID, Aware.getSetting(getApplicationContext(), Aware_Preferences.DEVICE_ID));
-                    cv.put(ScreenText_Provider.ScreenTextData.PACKAGE_NAME, appName);
-                    cv.put(ScreenText_Provider.ScreenTextData.CLASS_NAME, event.getClassName() != null ? event.getClassName().toString() : "");
-                    cv.put(ScreenText_Provider.ScreenTextData.USER_ACTION, event.getAction());
-                    cv.put(ScreenText_Provider.ScreenTextData.EVENT_TYPE, event.getEventType());
-                    cv.put(ScreenText_Provider.ScreenTextData.TEXT, latestScreenText.toString());
-
-                    Log.d(TAG, "SCREENTEXT: " + latestScreenText.toString());
-
-                    contentBuffer.add(cv);
-
-                    if (contentBuffer.size() >= TEXT_BUFFER_LIMIT) {
-                        for (ContentValues content : contentBuffer) {
-                            getContentResolver().insert(ScreenText_Provider.ScreenTextData.CONTENT_URI, content);
-                            if (awareSensor != null) awareSensor.onScreentext(content);
-                            sendBroadcast(new Intent(ScreenText.ACTION_SCREENTEXT_DETECT));
-                        }
-                        textBuffer.clear();
-                        contentBuffer.clear();
-                    }
-                }
-            };
-            handler.postDelayed(screenTextSaver, SCREEN_TEXT_DELAY_MS);
+            // Cancel previous save task and schedule the new one
+            if (screenTextSaver != null && backgroundHandler != null) {
+                backgroundHandler.removeCallbacks(screenTextSaver);
+                backgroundHandler.postDelayed(screenTextSaver, SCREEN_TEXT_DELAY_MS);
+            }
         }
     }
 
@@ -677,6 +695,29 @@ public class Applications extends AccessibilityService {
 
         if (DEBUG) Log.d(Aware.TAG, "Aware service connected to accessibility services...");
 
+        backgroundThread = new HandlerThread("ScreenTextBackground");
+        backgroundThread.start();
+        backgroundHandler = new Handler(backgroundThread.getLooper());
+
+        // Periodic screen text flush every 5 minutes to prevent memory build-up
+        backgroundHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                synchronized (contentBuffer) {
+                    if (!contentBuffer.isEmpty()) {
+                        Log.d(TAG, "Periodic flush: " + contentBuffer.size() + " entries.");
+                        for (ContentValues content : contentBuffer) {
+                            getContentResolver().insert(ScreenText_Provider.ScreenTextData.CONTENT_URI, content);
+                            if (awareSensor != null) awareSensor.onScreentext(content);
+                            sendBroadcast(new Intent(ScreenText.ACTION_SCREENTEXT_DETECT));
+                        }
+                        contentBuffer.clear();
+                    }
+                }
+                backgroundHandler.postDelayed(this, 5 * 60 * 1000); // every 5 minutes
+            }
+        }, 5 * 60 * 1000);
+
         //This makes sure that plugins and apps can check if the accessibility service is active
         Aware.setSetting(this, Applications.STATUS_AWARE_ACCESSIBILITY, true);
 
@@ -809,6 +850,13 @@ public class Applications extends AccessibilityService {
     @Override
     public void onDestroy() {
         super.onDestroy();
+
+        if (backgroundThread != null) {
+            backgroundThread.quitSafely();
+            backgroundThread = null;
+            backgroundHandler = null;
+        }
+
         //Aware.debug(this, "destroyed: " + getClass().getName() + " package: " + getPackageName());
     }
 
