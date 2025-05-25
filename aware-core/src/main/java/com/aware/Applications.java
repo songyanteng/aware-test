@@ -126,6 +126,7 @@ public class Applications extends AccessibilityService {
     }
 
     private long lastCaptureTime = 0;
+    private int lastCapturedTextHash = 0;
 
     private Handler handler = new Handler(Looper.getMainLooper());
     private JSONArray latestScreenText;
@@ -181,6 +182,20 @@ public class Applications extends AccessibilityService {
         }
     };
 
+    private final BroadcastReceiver screenStatusReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (intent.getAction().equals(Intent.ACTION_SCREEN_OFF)) {
+                setScreenStatus(1); // screen off
+            } else if (intent.getAction().equals(Intent.ACTION_SCREEN_ON)) {
+                setScreenStatus(2); // screen on
+            } else if (intent.getAction().equals(Intent.ACTION_USER_PRESENT)) {
+                setScreenStatus(0); // unlocked
+            }
+            Log.d(TAG, "Screen status updated: " + getScreenStatus());
+        }
+    };
+
     /**
      * Recursively track all the text on the screen in a tree structure to the text variable
      *
@@ -195,14 +210,14 @@ public class Applications extends AccessibilityService {
 
         String cls = mNodeInfo.getClassName().toString();
 
-        if (!(cls.endsWith("TextView")
-                || cls.endsWith("Button")
-                || cls.endsWith("EditText"))) {
-            // skip non-text widgets
-            return;
-        }
+//        if (!(cls.endsWith("TextView")
+//                || cls.endsWith("Button")
+//                || cls.endsWith("EditText"))) {
+//            // skip non-text widgets
+//            return;
+//        }
 
-        // conditions to filter the meaningless input
+        // conditions to filter empty input
         CharSequence txt = mNodeInfo.getText();
         if (txt != null && txt.length() > 0
                 && mNodeInfo.isVisibleToUser()) {
@@ -335,6 +350,13 @@ public class Applications extends AccessibilityService {
                     Log.w(TAG, "Failed to build JSON for one node – skipping", e);
                 }
             }
+
+            int currentTextHash = allNodes.toString().hashCode();
+            if (currentTextHash == lastCapturedTextHash) {
+                Log.d(TAG, "Duplicate screen text detected, skipping capture.");
+                return;
+            }
+            lastCapturedTextHash = currentTextHash;
 
             synchronized (this) {
                 latestScreenText = allNodes;
@@ -725,6 +747,12 @@ public class Applications extends AccessibilityService {
         webservices.addAction(Aware.ACTION_AWARE_SYNC_DATA);
         registerReceiver(awareMonitor, webservices);
 
+        IntentFilter screenFilter = new IntentFilter();
+        screenFilter.addAction(Intent.ACTION_SCREEN_ON);
+        screenFilter.addAction(Intent.ACTION_SCREEN_OFF);
+        screenFilter.addAction(Intent.ACTION_USER_PRESENT);
+        registerReceiver(screenStatusReceiver, screenFilter);
+
         if (Aware.getSetting(getApplicationContext(), Aware_Preferences.FOREGROUND_PRIORITY).equals("true")) {
             sendBroadcast(new Intent(Aware.ACTION_AWARE_PRIORITY_FOREGROUND));
         }
@@ -856,6 +884,13 @@ public class Applications extends AccessibilityService {
             backgroundThread = null;
             backgroundHandler = null;
         }
+
+        try {
+            unregisterReceiver(screenStatusReceiver);
+        } catch (IllegalArgumentException e) {
+            // Receiver not registered
+        }
+
 
         //Aware.debug(this, "destroyed: " + getClass().getName() + " package: " + getPackageName());
     }
