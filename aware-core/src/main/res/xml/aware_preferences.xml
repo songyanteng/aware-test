@@ -130,7 +130,7 @@
                 android:dependency="status_applications"
                 android:key="status_notifications"
                 android:persistent="true"
-                android:summary="Notifications sent by any application, without text content"
+                android:summary="Notifications sent by any application"
                 android:title="Application notifications" />
 
             <CheckBoxPreference

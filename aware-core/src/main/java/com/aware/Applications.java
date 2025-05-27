@@ -23,6 +23,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
+import android.os.Parcelable;
 import android.os.PowerManager;
 import android.provider.Settings;
 import android.util.DisplayMetrics;
@@ -53,6 +54,7 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
@@ -383,37 +385,71 @@ public class Applications extends AccessibilityService {
     }
 
     private void handleNotifications(AccessibilityEvent event) {
-        if (Aware.getSetting(getApplicationContext(), Aware_Preferences.STATUS_NOTIFICATIONS).equals("true") && event.getEventType() == AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED) {
-            Notification notificationDetails = (Notification) event.getParcelableData();
-            if (notificationDetails != null) {
-                ContentValues rowData = new ContentValues();
-                rowData.put(Applications_Notifications.DEVICE_ID, Aware.getSetting(getApplicationContext(), Aware_Preferences.DEVICE_ID));
-                rowData.put(Applications_Notifications.TIMESTAMP, System.currentTimeMillis());
-                rowData.put(Applications_Notifications.PACKAGE_NAME, event.getPackageName().toString());
-                rowData.put(Applications_Notifications.APPLICATION_NAME, getApplicationName(event.getPackageName().toString()));
-
-                if (Aware.getSetting(getApplicationContext(), Aware_Preferences.MASK_NOTIFICATION_TEXT).equals("true"))
-                    rowData.put(Applications_Notifications.TEXT, Encrypter.hash(getApplicationContext(), event.getText().toString()));
-                else
-                    rowData.put(Applications_Notifications.TEXT, event.getText().toString());
-
-                rowData.put(Applications_Notifications.SOUND, ((notificationDetails.sound != null) ? notificationDetails.sound.toString() : ""));
-                rowData.put(Applications_Notifications.VIBRATE, ((notificationDetails.vibrate != null) ? notificationDetails.vibrate.toString() : ""));
-                rowData.put(Applications_Notifications.DEFAULTS, notificationDetails.defaults);
-                rowData.put(Applications_Notifications.FLAGS, notificationDetails.flags);
-
-                if (DEBUG) Log.d(TAG, "New notification:" + rowData.toString());
-
-                getContentResolver().insert(Applications_Notifications.CONTENT_URI, rowData);
-
-                if (awareSensor != null) awareSensor.onNotification(rowData);
-
-                Intent notification = new Intent(ACTION_AWARE_APPLICATIONS_NOTIFICATIONS);
-                notification.putExtra(EXTRA_DATA, rowData);
-                sendBroadcast(notification);
-            }
+        if (!Aware.getSetting(getApplicationContext(), Aware_Preferences.STATUS_NOTIFICATIONS)
+                .equals("true")
+                || event.getEventType() != AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED) {
+            return;
         }
+
+        Parcelable data = event.getParcelableData();
+        if (!(data instanceof Notification)) return;
+        Notification notif = (Notification) data;
+
+        ContentValues rowData = new ContentValues();
+        String pkg = event.getPackageName() != null
+                ? event.getPackageName().toString()
+                : "";
+        rowData.put(Applications_Notifications.DEVICE_ID,
+                Aware.getSetting(getApplicationContext(), Aware_Preferences.DEVICE_ID));
+        rowData.put(Applications_Notifications.TIMESTAMP, System.currentTimeMillis());
+        rowData.put(Applications_Notifications.PACKAGE_NAME, pkg);
+        rowData.put(Applications_Notifications.APPLICATION_NAME,
+                getApplicationName(pkg));
+
+        Bundle extras = notif.extras;
+        String title = extras.getString(Notification.EXTRA_TITLE, "");
+        CharSequence txtCs = extras.getCharSequence(Notification.EXTRA_TEXT);
+        String body = txtCs != null
+                ? txtCs.toString()
+                : extras.getString(Notification.EXTRA_BIG_TEXT, "");
+
+        JSONObject payload = new JSONObject();
+        boolean mask = Aware.getSetting(getApplicationContext(),
+                Aware_Preferences.MASK_NOTIFICATION_TEXT).equals("true");
+        try {
+            if (mask) {
+                payload.put("title", Encrypter.hash(getApplicationContext(), title));
+                payload.put("text",  Encrypter.hash(getApplicationContext(), body));
+            } else {
+                payload.put("title", title);
+                payload.put("text",  body);
+            }
+        } catch (JSONException e) {
+            Log.w(TAG, "Failed to build notification JSON", e);
+            // fallback: just shove the raw body in TEXT
+            rowData.put(Applications_Notifications.TEXT, body);
+        }
+
+        rowData.put(Applications_Notifications.TEXT, payload.toString());
+        rowData.put(Applications_Notifications.SOUND,
+                notif.sound != null ? notif.sound.toString() : "");
+        rowData.put(Applications_Notifications.VIBRATE,
+                notif.vibrate != null
+                        ? Arrays.toString(notif.vibrate)
+                        : "");
+        rowData.put(Applications_Notifications.DEFAULTS, notif.defaults);
+        rowData.put(Applications_Notifications.FLAGS,    notif.flags);
+
+        if (DEBUG) Log.d(TAG, "Captured notification JSON: " + payload.toString());
+
+        // 8. Insert & broadcast
+        getContentResolver().insert(Applications_Notifications.CONTENT_URI, rowData);
+        if (awareSensor != null) awareSensor.onNotification(rowData);
+        Intent notification = new Intent(ACTION_AWARE_APPLICATIONS_NOTIFICATIONS);
+        notification.putExtra(EXTRA_DATA, rowData);
+        sendBroadcast(notification);
     }
+
 
     private void handleForegroundApps(AccessibilityEvent event) {
         if (Aware.getSetting(getApplicationContext(), Aware_Preferences.STATUS_APPLICATIONS).equals("true") && event.getEventType() == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
