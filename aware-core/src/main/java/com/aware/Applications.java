@@ -6,6 +6,8 @@ import android.accessibilityservice.AccessibilityServiceInfo;
 import android.app.*;
 import android.app.ActivityManager.ProcessErrorStateInfo;
 import android.app.ActivityManager.RunningAppProcessInfo;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
 import android.content.*;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageInfo;
@@ -15,11 +17,13 @@ import android.content.res.Resources;
 import android.database.Cursor;
 import android.database.SQLException;
 import android.database.sqlite.SQLiteException;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.provider.Settings;
 import android.util.DisplayMetrics;
 import android.util.Log;
@@ -74,6 +78,9 @@ public class Applications extends AccessibilityService {
     private static String TAG = "AWARE::Applications";
     private static boolean DEBUG = false;
 
+    private static final int    NOTIF_ID    = 101;
+    private static final String CHANNEL_ID  = "aware_accessibility";
+
     public static final String STATUS_AWARE_ACCESSIBILITY = "STATUS_AWARE_ACCESSIBILITY";
 
     /**
@@ -127,6 +134,11 @@ public class Applications extends AccessibilityService {
 
     private long lastCaptureTime = 0;
     private int lastCapturedTextHash = 0;
+
+    private static final long HEALTH_CHECK_INTERVAL_MS = 60_000;
+
+    private Handler     healthHandler;
+    private Runnable    healthCheckRunnable;
 
     private Handler handler = new Handler(Looper.getMainLooper());
     private JSONArray latestScreenText;
@@ -701,6 +713,42 @@ public class Applications extends AccessibilityService {
     protected void onServiceConnected() {
         super.onServiceConnected();
 
+        // Check if accessibility service is still active
+        healthHandler = new Handler(Looper.getMainLooper());
+        healthCheckRunnable = new Runnable() {
+            @Override
+            public void run() {
+                // shows a notification if the service is disabled
+                Applications.isAccessibilityServiceActive(getApplicationContext());
+                // schedule next check
+                healthHandler.postDelayed(this, HEALTH_CHECK_INTERVAL_MS);
+            }
+        };
+        // kick off the first check in 1 minute
+        healthHandler.postDelayed(healthCheckRunnable, HEALTH_CHECK_INTERVAL_MS);
+
+        // Foreground service
+        createNotificationChannel();
+        NotificationCompat.Builder b = new NotificationCompat.Builder(this, CHANNEL_ID)
+                .setContentTitle("AWARE Accessibility Service")
+                .setContentText("Please keep the accessibility service active")
+                .setSmallIcon(R.drawable.ic_stat_aware_accessibility)
+                .setOngoing(true);
+        startForeground(NOTIF_ID, b.build());
+
+        // Battery optimisation whitelist
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+            String pkg = getPackageName();
+            if (pm != null && !pm.isIgnoringBatteryOptimizations(pkg)) {
+                Intent intent = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+                intent.setData(Uri.parse("package:" + pkg));
+                // Must add this since you're in a Service
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                startActivity(intent);
+            }
+        }
+
         AUTHORITY = Applications_Provider.getAuthority(this);
 
         if (!Aware.IS_CORE_RUNNING) {
@@ -807,6 +855,20 @@ public class Applications extends AccessibilityService {
         }
     }
 
+    private void createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationChannel channel = new NotificationChannel(
+                    CHANNEL_ID,
+                    "AWARE Accessibility",
+                    NotificationManager.IMPORTANCE_LOW
+            );
+            channel.setDescription("Keep the accessibility service alive");
+            NotificationManager mgr = getSystemService(NotificationManager.class);
+            if (mgr != null) mgr.createNotificationChannel(channel);
+        }
+    }
+
+
     @Override
     public void onInterrupt() {
         if (Aware.getSetting(getApplicationContext(), Applications.STATUS_AWARE_ACCESSIBILITY).equals("true")) {
@@ -820,6 +882,8 @@ public class Applications extends AccessibilityService {
         Aware.startScheduler(this);
 
         Log.d(TAG, "Accessibility Service has been interrupted...");
+
+        isAccessibilityServiceActive(this);
     }
 
     @Override
@@ -846,6 +910,8 @@ public class Applications extends AccessibilityService {
         );
 
         Log.d(TAG, "Accessibility Service has been unbound...");
+
+        isAccessibilityServiceActive(this);
 
         return super.onUnbind(intent);
     }
@@ -878,6 +944,10 @@ public class Applications extends AccessibilityService {
     @Override
     public void onDestroy() {
         super.onDestroy();
+
+        if (healthHandler != null && healthCheckRunnable != null) {
+            healthHandler.removeCallbacks(healthCheckRunnable);
+        }
 
         if (backgroundThread != null) {
             backgroundThread.quitSafely();
